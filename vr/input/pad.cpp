@@ -1,6 +1,7 @@
 // vr/input/pad.cpp - cut from vr/vrcam.cpp (docs/plan_modules.md M10); what it gives: vr/input/input.h. It sees vrcam.cpp's headers.
 #include "../vrcam_headers.h"
 #include "../flat_keys_why.h"   // why W A S D do not walk in flat F2 / F3 (FlatPadTick)
+#include "../view/desktop_flycam.h"
 
 using namespace D2RL;
 using namespace vrc;   // as in vrcam.cpp
@@ -866,7 +867,7 @@ template <int I> DWORD WINAPI XDetour(DWORD idx, XINPUT_STATE* s) {
     // the game for its controller UI (docs/move_recon.md §6). Only the outermost call: xinput9_1_0 calls into xinput1_4, both hooked.
     if (t_xDepth == 0 && FlatNoPad()) {
         // [input] flat_pad_on_touch: the real pad is read (the game never sees it); touched once, the pads go through from then on
-        if (g_set.flatPadOnTouch.load() && idx == 0) {
+        if (g_set.flatPadOnTouch.load() && idx < XUSER_MAX_COUNT) {
             XINPUT_STATE real{};
             ++t_xDepth;
             const DWORD got = g_xhooks[I].orig(idx, &real);
@@ -876,7 +877,7 @@ template <int I> DWORD WINAPI XDetour(DWORD idx, XINPUT_STATE* s) {
                 !g_flatPadTouched.exchange(true))
                 Log("vrcam: flat: the real pad was touched - the game sees it from now on ([input] flat_pad_on_touch; flat_no_pad hides pads only until a pad is used)");
         }
-        if (FlatNoPad()) {
+        if (FlatNoPad() && !flycam::Active()) {
             if (s) memset(s, 0, sizeof *s);
             return ERROR_DEVICE_NOT_CONNECTED;
         }
@@ -893,6 +894,7 @@ template <int I> DWORD WINAPI XDetour(DWORD idx, XINPUT_STATE* s) {
     const DWORD origResult = r;
     --t_xDepth;
     trace.Resume();
+    if (outer && s) flycam::FilterPad(idx, origResult == ERROR_SUCCESS ? s : nullptr);
     // Flat with a real pad let through (flat_no_pad=0): that pad only, its stick
     // turned by the camera below; BodyWalk's stick walks through the keyboard move.
     bool mirror = false;

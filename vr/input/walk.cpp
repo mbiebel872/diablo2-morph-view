@@ -159,8 +159,10 @@ bool BodyWalkWalk(float* px, float* py, bool* own = nullptr) {
 // with the game's own dead zone (0x1210DA0: 10349, no rescale), relative to
 // the camera while ours is on.
 bool FlatMoveInput(float* px, float* py, const char** from) {
-    float x = 0.0f, y = 0.0f;
-    if (ShooterActive() && GameFocused() && !ChatOpen()) {
+    float x = 0.0f, y = flycam::NativeHeroStep();
+    if (y != 0.0f) {
+        *from = "flycam D-pad";
+    } else if (ShooterActive() && GameFocused() && !ChatOpen()) {
         auto held = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
         y = (held('W') ? 1.0f : 0.0f) - (held('S') ? 1.0f : 0.0f);
         x = (held('D') ? 1.0f : 0.0f) - (held('A') ? 1.0f : 0.0f);
@@ -356,6 +358,11 @@ void WalkStartNote(bool given, float x, float y) {
 
 float* HookStickGet(void* handler, float* out, uint32_t player) {
     float* r = OrigStickGet(handler, out, player);
+    if (r && player == 0 && g_set.platform.load() == 0
+        && (uintptr_t)_ReturnAddress() == d2rsig::Addr(RVA_WALK_STICK_RET)) {
+        flycam::FilterNativeWalk(r[0], r[1]);
+        return r;
+    }
     if (r && g_handWalk.load(std::memory_order_relaxed) && (uintptr_t)_ReturnAddress() == d2rsig::Addr(RVA_WALK_STICK_RET))
         g_handWalkReads.fetch_add(1, std::memory_order_relaxed);   // [openxr] hand_inventory: the game's walk got past its own gate to the stick
     if (r && (uintptr_t)_ReturnAddress() == d2rsig::Addr(RVA_WALK_STICK_RET) && !DirectWalkNow() && player == 0)
@@ -384,14 +391,17 @@ float* HookStickGet(void* handler, float* out, uint32_t player) {
     return r;
 }
 
-// VR with direct_walk; tried with the others twice a second. The code decrypts the
+// Flat controller movement or VR with direct_walk. The code decrypts the
 // first time it runs (in controller mode), so no "not possible" verdict by time.
 void InstallStickHook() {
-    if (!g_ctx || g_stickHook.load() != 0 || g_set.platform.load() != 1 || !g_set.directWalk.load()) return;
+    const bool flat = g_set.platform.load() == 0;
+    if (!g_ctx || g_stickHook.load() != 0 || (!flat && !g_set.directWalk.load())) return;
     if (!Matches(RVA_STICK_GET, kSigStickGet, sizeof kSigStickGet) || !d2rsig::Addr(RVA_WALK_STICK_RET)) return;
     const bool in = d2rsig::Hook(RVA_STICK_GET, kSigStickGet, sizeof kSigStickGet, (void*)&HookStickGet, (void**)&OrigStickGet);
     g_stickHook.store(in ? 1 : 2);
-    Log(in ? "vrcam: VR: walking stick hook in - BodyWalk's stick walks the hero straight, the pad's left stick is kept from the game"
+    if (flat) Log(in ? "vrcam: flat: native controller walking hook installed"
+                     : "vrcam: flat: native controller walking hook failed");
+    else Log(in ? "vrcam: VR: walking stick hook in - BodyWalk's stick walks the hero straight, the pad's left stick is kept from the game"
            : "vrcam: VR: walking stick hook FAILED - the hero walks through the pad's left stick as before");
 }
 

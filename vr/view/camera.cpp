@@ -2,6 +2,7 @@
 #include "../vrcam_headers.h"
 #include "../billboards.h"   // [stereo] portal_once: the head's centre each view build
 #include "desktop_flycam.h"
+#include "dualsense_camera.h"
 
 #include <mutex>
 
@@ -18,14 +19,69 @@ namespace flycam {
 namespace {
 std::atomic<bool> active{false};
 std::atomic<uint32_t> heldKeys{0};
+std::atomic<bool> splitPad{false};
 
-// The window thread owns the keys. The view builder steps the pose with look
-// deltas from MouseTick. The lock keeps each activation and its deltas together.
+// The view builder takes mouse deltas and the latest physical pad report.
+// The lock keeps those inputs together with the activation they belong to.
 std::mutex poseLock;
 Pose pose;
 bool needPose = true;
 ULONGLONG lastViewAt = 0;
 float pendingYaw = 0.0f, pendingPitch = 0.0f;
+constexpr ULONGLONG kPadFreshMs = 250;
+constexpr SHORT kHeroNudge = 15000;
+PadMotion padMotion;
+int heroPivot = 0;
+int padSlot = -1;
+ULONGLONG padAt = 0;
+ULONGLONG xinputAt = 0;
+dualsense::Reader nativePad;
+dualsense::PadSample nativeReport;
+ULONGLONG nativeAt = 0;
+bool nativePadLogged = false;
+bool nativeLeftHeld = false;
+struct PadCapture {
+    WORD buttons = 0;
+    bool leftStick = false, rightStick = false;
+    bool leftTrigger = false, rightTrigger = false;
+    bool filtered = false;
+    DWORD packet = 0;
+    XINPUT_GAMEPAD sent{};
+};
+PadCapture padCaptures[XUSER_MAX_COUNT]{};
+
+V3 PadStick(SHORT x, SHORT y, float deadzone) {
+    const float length = std::hypot(float(x), float(y));
+    const float amount = std::clamp((length - deadzone) / (32767.0f - deadzone), 0.0f, 1.0f);
+    const float scale = amount / std::max(1.0f, length);
+    return {x * scale, y * scale, 0.0f};
+}
+
+bool NativePadFresh(ULONGLONG now) {
+    return nativeAt && now - nativeAt <= kPadFreshMs
+        && (!xinputAt || now - xinputAt > kPadFreshMs);
+}
+
+V3 NativeLeft() {
+    return PadStick(nativeReport.leftX, nativeReport.leftDown, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
+}
+
+int PadDirection(WORD buttons, WORD positive, WORD negative) {
+    return int((buttons & positive) != 0) - int((buttons & negative) != 0);
+}
+
+int HeroStepDirection(WORD buttons) {
+    return PadDirection(buttons, XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_DOWN);
+}
+
+float NativeStepAmount() {
+    return HeroStepDirection(nativeReport.dpad) * (kHeroNudge / 32767.0f);
+}
+
+float PadTrigger(BYTE value) {
+    constexpr int deadzone = XINPUT_GAMEPAD_TRIGGER_THRESHOLD;
+    return float(std::max(0, int(value) - deadzone)) / (255.0f - deadzone);
+}
 }   // namespace
 
 bool Available() {
@@ -42,16 +98,21 @@ void Toggle() {
     if (!Available()) return;
     needPose = true;
     pendingYaw = pendingPitch = 0.0f;
+    padSlot = -1;
     const bool detached = !active.load();
+    const V3 left = NativeLeft();
+    nativeLeftHeld = !detached && !splitPad.load() && StickHookIn() && NativePadFresh(GetTickCount64())
+        && (left.x != 0.0f || left.y != 0.0f);
     active.store(detached);
     Log(detached ? "vrcam: desktop flycam detached" : "vrcam: desktop flycam returned");
 }
 
 void Stop(bool releaseKeys) {
-    if (Active()) {
-        const std::lock_guard<std::mutex> lock(poseLock);
-        active.store(false);
-    }
+    const std::lock_guard<std::mutex> lock(poseLock);
+    active.store(false);
+    nativeLeftHeld = false;
+    nativeAt = 0;
+    nativePad.Close();
     if (releaseKeys) heldKeys.store(0);
 }
 
@@ -75,6 +136,156 @@ void AddLook(float yawDegrees, float pitchDegrees) {
     pendingPitch = std::clamp(pendingPitch + pitchDegrees, -180.0f, 180.0f);
 }
 
+void SetSplitPad(bool split) {
+    if (splitPad.load() == split) return;
+    const std::lock_guard<std::mutex> lock(poseLock);
+    splitPad.store(split);
+    padSlot = -1;
+    nativeLeftHeld = false;
+}
+
+void PollNativePad() {
+    const bool ready = g_set.platform.load() == 0 && ViewNow() != 1
+        && g_enabled.load() && g_inWorld.load() && GameFocused() && !gamestate::MenuOpen() && !ChatOpen();
+    const std::lock_guard<std::mutex> lock(poseLock);
+    const ULONGLONG now = GetTickCount64();
+    if (!ready || (xinputAt && now - xinputAt <= kPadFreshMs)) {
+        nativePad.Close();
+        nativeAt = 0;
+        nativeLeftHeld = false;
+        return;
+    }
+    if (!nativePad.Read(now, nativeReport)) {
+        nativeAt = 0;
+        nativeLeftHeld = false;
+        return;
+    }
+    nativeAt = now;
+    const V3 left = NativeLeft();
+    if (left.x == 0.0f && left.y == 0.0f) nativeLeftHeld = false;
+    if (!nativePadLogged) {
+        Log("vrcam: reading DualSense sticks and D-pad directly");
+        nativePadLogged = true;
+    }
+}
+
+bool NativeLook(float& x, float& y) {
+    const std::lock_guard<std::mutex> lock(poseLock);
+    if (active.load() || !NativePadFresh(GetTickCount64())) return false;
+    constexpr float normalize = 1.0f / 32768.0f;
+    x = nativeReport.rightX * normalize;
+    y = -nativeReport.rightDown * normalize;
+    return true;
+}
+
+void FilterNativeWalk(float& x, float& y) {
+    {
+        const std::lock_guard<std::mutex> lock(poseLock);
+        if (!NativePadFresh(GetTickCount64())) return;
+        if (nativeLeftHeld) {
+            x = y = 0.0f;
+            return;
+        }
+        if (active.load() && !splitPad.load()) {
+            x = 0.0f;
+            y = NativeStepAmount();
+        }
+    }
+    ViewStickToGame(&x, &y);
+}
+
+float NativeHeroStep() {
+    const std::lock_guard<std::mutex> lock(poseLock);
+    return active.load() && !splitPad.load() && NativePadFresh(GetTickCount64())
+        ? NativeStepAmount() : 0.0f;
+}
+
+int HeroPivot() {
+    const std::lock_guard<std::mutex> lock(poseLock);
+    if (!active.load() || splitPad.load()) return 0;
+    const ULONGLONG now = GetTickCount64();
+    if (NativePadFresh(now)) {
+        return PadDirection(nativeReport.dpad, XINPUT_GAMEPAD_DPAD_RIGHT, XINPUT_GAMEPAD_DPAD_LEFT);
+    }
+    return padSlot >= 0 && now - padAt <= kPadFreshMs ? heroPivot : 0;
+}
+
+void FilterPad(unsigned slot, XINPUT_STATE* state) {
+    if (slot >= XUSER_MAX_COUNT) return;
+    const std::lock_guard<std::mutex> lock(poseLock);
+    PadCapture& held = padCaptures[slot];
+    const int slotNumber = static_cast<int>(slot);
+    if (!state) {
+        held = {};
+        if (padSlot == slotNumber) padSlot = -1;
+        return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (g_set.platform.load() == 0) xinputAt = now;
+    const bool detached = active.load() && Available();
+    if (!detached && !held.buttons && !held.leftStick && !held.rightStick
+        && !held.leftTrigger && !held.rightTrigger && !held.filtered) return;
+
+    XINPUT_GAMEPAD& gamepad = state->Gamepad;
+    const XINPUT_GAMEPAD raw = gamepad;
+    const V3 left = PadStick(raw.sThumbLX, raw.sThumbLY, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE);
+    const V3 right = PadStick(raw.sThumbRX, raw.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
+    const bool leftMoved = left.x != 0.0f || left.y != 0.0f;
+    const bool rightMoved = right.x != 0.0f || right.y != 0.0f;
+    const float lower = PadTrigger(raw.bLeftTrigger), raise = PadTrigger(raw.bRightTrigger);
+    // Camera inputs wait for release before becoming gameplay inputs again.
+    held.buttons &= raw.wButtons;
+    held.leftStick &= leftMoved;
+    held.rightStick &= rightMoved;
+    held.leftTrigger &= lower > 0.0f;
+    held.rightTrigger &= raise > 0.0f;
+
+    if (padSlot >= 0 && now - padAt > kPadFreshMs) padSlot = -1;
+    const bool split = splitPad.load();
+    constexpr WORD r3 = XINPUT_GAMEPAD_RIGHT_THUMB;
+    constexpr WORD cameraButtons = WORD(~(XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_BACK));
+    const bool capturing = detached && (!split || padSlot < 0 || padSlot == slotNumber);
+    const bool translate = capturing && split && (raw.wButtons & r3);
+    const bool fullCamera = capturing && !split;
+    const bool triggersForCamera = translate || fullCamera;
+    const WORD borrowed = fullCamera ? WORD(raw.wButtons & cameraButtons) : translate ? r3 : 0;
+    const bool padUsed = rightMoved || borrowed || (fullCamera && (leftMoved || lower > 0.0f || raise > 0.0f));
+    if (capturing && (padSlot == slotNumber || (padSlot < 0 && padUsed))) {
+        padSlot = slotNumber;
+        padAt = now;
+        padMotion = fullCamera ? PadMotion{left.x, left.y, raise - lower, right.x, -right.y,
+            float(PadDirection(raw.wButtons, XINPUT_GAMEPAD_RIGHT_SHOULDER, XINPUT_GAMEPAD_LEFT_SHOULDER))}
+            : translate ? PadMotion{right.x, right.y, raise - lower}
+                        : PadMotion{0.0f, 0.0f, 0.0f, right.x, -right.y};
+        heroPivot = fullCamera ? PadDirection(raw.wButtons, XINPUT_GAMEPAD_DPAD_RIGHT, XINPUT_GAMEPAD_DPAD_LEFT) : 0;
+    }
+    held.buttons |= borrowed;
+    held.leftStick |= fullCamera && leftMoved;
+    held.rightStick |= capturing && rightMoved;
+    held.leftTrigger |= triggersForCamera && lower > 0.0f;
+    held.rightTrigger |= triggersForCamera && raise > 0.0f;
+
+    if (capturing || held.rightStick) gamepad.sThumbRX = gamepad.sThumbRY = 0;
+    if (fullCamera || held.leftStick) gamepad.sThumbLX = gamepad.sThumbLY = 0;
+    if (fullCamera && padSlot == slotNumber) {
+        // A light push of the hero's normal movement stick, relative to the attached heading.
+        gamepad.sThumbLY = SHORT(kHeroNudge * HeroStepDirection(raw.wButtons));
+    }
+    gamepad.wButtons &= WORD(~held.buttons);
+    if (triggersForCamera || held.leftTrigger) gamepad.bLeftTrigger = 0;
+    if (triggersForCamera || held.rightTrigger) gamepad.bRightTrigger = 0;
+    const bool filtered = std::memcmp(&gamepad, &raw, sizeof gamepad) != 0;
+    if (filtered) {
+        // Reattaching can change the mapped stick even while the raw report is identical.
+        if (!held.filtered) held.packet = state->dwPacketNumber ^ 0x80000000u;
+        else if (std::memcmp(&gamepad, &held.sent, sizeof gamepad) != 0) ++held.packet;
+        if (held.packet == state->dwPacketNumber) ++held.packet;
+        state->dwPacketNumber = held.packet;
+        held.sent = gamepad;
+    }
+    held.filtered = filtered;
+}
+
 static void Apply(V3& eye, V3& forward, V3& ahead, V3& right, V3& up) {
     const std::lock_guard<std::mutex> lock(poseLock);
     if (!active.load()) return;
@@ -86,7 +297,18 @@ static void Apply(V3& eye, V3& forward, V3& ahead, V3& right, V3& up) {
     }
     const float dt = std::min(0.05f, float(now - lastViewAt) * 0.001f);
     lastViewAt = now;
-    pose.Step(heldKeys.load(), dt, pendingYaw, pendingPitch, forward, ahead, right, up);
+    PadMotion motion = padSlot >= 0 && now - padAt <= kPadFreshMs ? padMotion : PadMotion{};
+    if (NativePadFresh(now)) {
+        const V3 look = PadStick(nativeReport.rightX, nativeReport.rightDown, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE);
+        motion.yaw = look.x;
+        motion.pitch = look.y;
+        if (!splitPad.load() && StickHookIn()) {
+            const V3 left = NativeLeft();
+            motion.strafe = left.x;
+            motion.forward = -left.y;
+        }
+    }
+    pose.Step(heldKeys.load(), motion, dt, pendingYaw, pendingPitch, forward, ahead, right, up);
     pendingYaw = pendingPitch = 0.0f;
     eye = pose.eye;
 }

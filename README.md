@@ -110,7 +110,34 @@ focus also returns the camera.
 | Z / C | Bank left and right |
 
 Camera movement keys and mouse input belong to the flycam while it is active.
-The hero keeps their heading as you move and turn the flycam.
+The hero keeps their heading until you adjust their pose.
+
+### Controllers
+
+In the attached view, the left stick moves the hero relative to the view
+and the right stick looks around.
+
+Shift + F6 switches between regular gameplay and the flycam. In the default
+layout, both sticks control the camera while detached and the D-pad adjusts
+the hero's pose. XInput Start and Back still reach the game.
+
+| Input | Action in free cam | Controller |
+| --- | --- | --- |
+| Left stick | Fly forward, backward, left, and right | XInput and DualSense |
+| Right stick | Look around | XInput and DualSense |
+| D-pad left / right | Pivot the hero in place | XInput and DualSense |
+| D-pad up / down | Step forward or backward | XInput and DualSense |
+| LT / RT | Descend and ascend | XInput |
+| LB / RB | Bank left and right | XInput |
+
+For the split layout, set `flycam_split_pad=1` under `[input]` in `d2r_vr.ini`.
+The left stick and D-pad control the hero. The right stick looks around.
+On XInput, hold R3 to fly with the right stick and use LT / RT for height.
+
+When the game receives no XInput reports, the mod can read a standard
+DualSense directly. If Diablo has the native D-pad bound to potions, posing
+can also use a potion. Keyboard potion keys remain available.
+
 The world still loads around the hero, so distant parts of the scene may disappear
 from the view.
 

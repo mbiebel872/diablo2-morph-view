@@ -2,6 +2,7 @@
 // (ReloadIfChanged) - cut from vr/vrcam.cpp (docs/plan_modules.md M2). It reaches into most features: it sees vrcam.cpp's headers
 // (vr/vrcam_headers.h) and the names of vrcam.cpp it sets (vr/vrcam_internal.h). Its place in the update thread is the same.
 #include "../vrcam_headers.h"
+#include "../view/desktop_flycam.h"
 #include "../../shared/draw_distance.h"
 #include "../../shared/render_type.h"   // the render type the keys make: one log line at each change
 #include "../../shared/quality_presets.h"   // [render] preset_game_options: the preset the keys match
@@ -1192,6 +1193,7 @@ void LoadSettings() {
     g_set.walkStartLog.store(IniB(L"debug", L"walk_start_log", false));
     g_set.flatNoPad.store(IniB(L"input", L"flat_no_pad", true));
     g_set.flatPadOnTouch.store(IniB(L"input", L"flat_pad_on_touch", true));
+    flycam::SetSplitPad(IniB(L"input", L"flycam_split_pad", false));
     g_set.flatClickShoot.store(IniB(L"input", L"flat_click_shoot", true));
     g_set.flatAimGround.store(IniB(L"input", L"flat_aim_ground", true));
     g_set.flatBodyPick.store(IniB(L"input", L"flat_body_pick", true));

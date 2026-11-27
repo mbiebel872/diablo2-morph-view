@@ -1,5 +1,6 @@
 // vr/view/views.cpp - cut from vr/vrcam.cpp (docs/plan_modules.md M16); what it gives: vr/view/camera.h. It sees vrcam.cpp's headers.
 #include "../vrcam_headers.h"
+#include "desktop_flycam.h"
 
 using namespace D2RL;
 using namespace vrc;   // as in vrcam.cpp
@@ -145,14 +146,28 @@ void TurnTick() {
     const float dt = (float)std::min(now - last, 0.1);
     last = now;
     struct Unlock { ~Unlock() { ReleaseSRWLockExclusive(&g_turnLock); } } unlock;
+    flycam::PollNativePad();
     // [camera] entry_facing: an arrival's turn into the area, once, on the body turn as the stick's - before a pair holds it, so both eyes take it
     if (const float entry = TakeEntryTurn(); entry != 0.0f && std::isfinite(entry)) { g_turnYaw.store(WrapDeg(g_turnYaw.load() + entry)); g_gen.fetch_add(1); }
+    if (flycam::Active()) {
+        const int direction = flycam::HeroPivot();
+        if (direction != 0) {
+            constexpr float pivotSpeed = 60.0f;   // degrees per second
+            g_turnYaw.store(WrapDeg(g_turnYaw.load() + direction * pivotSpeed * dt));
+            g_gen.fetch_add(1);
+        }
+        g_rightX.store(0.0f); g_rightY.store(0.0f);
+        armed = true;
+        return;
+    }
     if (!g_enabled.load() || !g_set.rightTurn.load()) { g_rightX.store(0.0f); g_rightY.store(0.0f); return; }
+    float rightX = g_rightX.load(), rightY = g_rightY.load();
+    flycam::NativeLook(rightX, rightY);
     // [camera] stick_pitch_f2 (VR F2): the stick's up / down tilts, at the turn's dead zone; a push more sideways than up / down
     // is a turn and does not tilt (vr/stick_pitch.h). Off: the tilt forgotten, the camera as before.
     if (!g_set.stickPitchF2.load()) g_stickPitch.store(0.0f);
     else if (StickPitchOn()) {
-        const float step = stickpitch::Step(g_rightX.load(), g_rightY.load(), dt, g_set.stickPitchSpeed.load(), g_set.stickPitchSign.load());
+        const float step = stickpitch::Step(rightX, rightY, dt, g_set.stickPitchSpeed.load(), g_set.stickPitchSign.load());
         if (step != 0.0f) {
             const stickpitch::Limits l{g_set.stickPitchMin.load(), g_set.stickPitchMax.load()};
             g_stickPitch.store(stickpitch::Apply(g_stickPitch.load(), step, g_set.pitch.load(), l));
@@ -162,13 +177,13 @@ void TurnTick() {
     // [camera] stick_pitch_flat (flat F2 / F3, a player with an Xbox pad: "the right stick pitch doesn't change the camera angle up and down"): the
     // right stick's up / down is the mouse's up / down - the same look, the same limits; the stick's shaping as the VR tilt's (vr/stick_pitch.h).
     if (g_set.stickPitchFlat.load() && FlatRules() && FlatRulesView() != 1) {   // (flat F2 / F3, VR F5)
-        const float step = stickpitch::Step(g_rightX.load(), g_rightY.load(), dt, g_set.stickPitchSpeed.load(), g_set.stickPitchSign.load());
+        const float step = stickpitch::Step(rightX, rightY, dt, g_set.stickPitchSpeed.load(), g_set.stickPitchSign.load());
         if (step != 0.0f) {
             g_mousePitch.store(std::clamp(g_mousePitch.load() + step, -90.0f, 90.0f));   // (+ looks lower, as the mouse's dy)
             g_gen.fetch_add(1);
         }
     }
-    const float x = g_set.turnSign.load() * g_rightX.load();
+    const float x = g_set.turnSign.load() * rightX;
     const float dead = 0.25f, a = fabsf(x);
     const float snap = g_set.snapAngle.load();
     if (snap > 0.0f) {

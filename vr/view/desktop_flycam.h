@@ -7,6 +7,8 @@
 #include <cmath>
 #include <cstdint>
 
+struct _XINPUT_STATE;
+
 namespace vrc::flycam {
 
 enum MoveKey : uint32_t {
@@ -32,6 +34,11 @@ using d2rcam::m4::V3;
 inline constexpr float kRadiansPerDegree = 3.14159265f / 180.0f;
 inline constexpr float kPitchLimit = 1.55f;
 
+struct PadMotion {
+    float strafe = 0.0f, forward = 0.0f, rise = 0.0f;
+    float yaw = 0.0f, pitch = 0.0f, bank = 0.0f;
+};
+
 struct Pose {
     V3 eye{};
     float heading = 0.0f, down = 0.0f, roll = 0.0f;
@@ -45,7 +52,7 @@ struct Pose {
         roll = std::atan2(Dot(up, lateral), Dot(up, Cross(lateral, forward)));
     }
 
-    void Step(uint32_t keys, float dt, float yawDegrees, float pitchDegrees,
+    void Step(uint32_t keys, const PadMotion& pad, float dt, float yawDegrees, float pitchDegrees,
               V3& forward, V3& ahead, V3& right, V3& up) {
         using namespace d2rcam::m4;
         constexpr float kSpeed = 24.0f;       // world units per second
@@ -54,9 +61,11 @@ struct Pose {
         const auto axis = [keys](MoveKey positive, MoveKey negative) {
             return float((keys & positive) != 0) - float((keys & negative) != 0);
         };
-        heading = std::remainder(heading - yawDegrees * kRadiansPerDegree, kTurn);
-        down = std::clamp(down + pitchDegrees * kRadiansPerDegree, -kPitchLimit, kPitchLimit);
-        roll = std::remainder(roll + axis(BankRight, BankLeft) * kBankSpeed * kRadiansPerDegree * dt, kTurn);
+        heading = std::remainder(heading - (yawDegrees + pad.yaw * 160.0f * dt) * kRadiansPerDegree, kTurn);
+        down = std::clamp(down + (pitchDegrees + pad.pitch * 120.0f * dt) * kRadiansPerDegree,
+                          -kPitchLimit, kPitchLimit);
+        const float bank = std::clamp(axis(BankRight, BankLeft) + pad.bank, -1.0f, 1.0f);
+        roll = std::remainder(roll + bank * kBankSpeed * kRadiansPerDegree * dt, kTurn);
 
         ahead = {-std::sin(heading), 0.0f, -std::cos(heading)};
         const V3 lateral{-ahead.z, 0.0f, ahead.x};
@@ -65,8 +74,9 @@ struct Pose {
         up = levelUp * std::cos(roll) + lateral * std::sin(roll);
         right = lateral * std::cos(roll) - levelUp * std::sin(roll);
 
-        const V3 move = forward * axis(Forward, Back) + lateral * axis(Right, Left)
-                      + V3{0.0f, axis(Raise, Lower), 0.0f};
+        const V3 move = forward * std::clamp(axis(Forward, Back) + pad.forward, -1.0f, 1.0f)
+                      + lateral * std::clamp(axis(Right, Left) + pad.strafe, -1.0f, 1.0f)
+                      + V3{0.0f, std::clamp(axis(Raise, Lower) + pad.rise, -1.0f, 1.0f), 0.0f};
         eye = eye + move * (dt * kSpeed / std::max(1.0f, Length(move)));
     }
 };
@@ -79,5 +89,12 @@ void Stop(bool releaseKeys = false);
 bool TakeKey(unsigned key, bool down, bool repeat);
 bool OwnsKey(unsigned key);
 void AddLook(float yawDegrees, float pitchDegrees);
+void SetSplitPad(bool split);
+void PollNativePad();
+bool NativeLook(float& x, float& y);
+void FilterNativeWalk(float& x, float& y);
+float NativeHeroStep();
+int HeroPivot();
+void FilterPad(unsigned slot, _XINPUT_STATE* state);
 
 }   // namespace vrc::flycam
