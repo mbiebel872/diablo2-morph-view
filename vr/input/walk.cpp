@@ -1,5 +1,6 @@
 // vr/input/walk.cpp - cut from vr/vrcam.cpp (docs/plan_modules.md M10); what it gives: vr/input/input.h. It sees vrcam.cpp's headers.
 #include "../vrcam_headers.h"
+#include "../view/desktop_flycam.h"
 
 using namespace D2RL;
 using namespace vrc;   // as in vrcam.cpp
@@ -12,7 +13,10 @@ bool PadMirrorRead(BWPadMirror* out, bool* walkOnly = nullptr, bool* pluginPad =
 // Mouse look and W A S D ([input] mouse_look, F9): the first-person game
 // without a headset. Live while our camera shows a game area and no menu is open.
 std::atomic<bool> g_mouseLookOn{false};
-bool ShooterActive() { return g_mouseLookOn.load() && g_enabled.load() && g_inWorld.load() && !gamestate::MenuOpen(); }
+bool ShooterActive() {
+    return g_mouseLookOn.load() && g_enabled.load() && g_inWorld.load()
+        && !gamestate::MenuOpen() && !flycam::BlocksHeroKeys();
+}
 
 // The game's chat line (Enter) is open: then W A S D are letters typed, not
 // ours. D2's UI-state array, one byte per panel at 0x2A2ADA0 (GetUIState

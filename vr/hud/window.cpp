@@ -1,6 +1,7 @@
 // vr/hud/window.cpp - cut from vr/vrcam.cpp (docs/plan_modules.md M9); what it gives: vr/hud/hud_vr.h. It sees vrcam.cpp's headers.
 #include "../vrcam_headers.h"
 #include "../view_keys.h"   // [view] keys: which F keys pick the view
+#include "../view/desktop_flycam.h"
 #include "../exit_end.h"    // [openxr] end_session_on_exit: which window messages are the game's quit
 #include "../menu_ready.h"  // no window move and no mouse message before the game's menus exist (crash group J)
 #include "../key_capture_wire.h"   // the overlays' "press a key"
@@ -82,6 +83,16 @@ LRESULT CALLBACK GameWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     }
     // [openxr] end_session_on_exit: the window closed (the X, Alt+F4) or Windows ending - the headset session ends before the game sees it and tears down
     if (const exitend::Trigger quit = exitend::FromWindow(msg, (uintptr_t)w); quit != exitend::Trigger::None) xr::EndOnExit((int)quit);
+    static viewkeys::Gate flycamToggle;
+    if (msg == WM_KILLFOCUS || (msg == WM_ACTIVATEAPP && !w)) {
+        flycam::Stop(true);
+        flycamToggle = {};
+    }
+    // Release captured presses even when a panel has taken keyboard focus.
+    if ((msg == WM_KEYUP || msg == WM_SYSKEYUP) && flycam::TakeKey((unsigned)w, false, false)) return 0;
+    if (msg == WM_KEYUP && w == VK_F6 && flycamToggle.Take(viewkeys::kShift, 6, (unsigned)w, false, false, false))
+        return 0;
+
     // The overlays' "press a key" (vr/key_capture_wire.h: the flat panel's key rows, the Gestures tab's key): while armed the next key is its answer,
     // Esc its cancel - neither reaches the game (nor the panel, which Esc would close)
     if (keycapwire::OnWindowMessage(msg, (uintptr_t)w, (intptr_t)l)) return 0;
@@ -89,6 +100,17 @@ LRESULT CALLBACK GameWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         intptr_t done = 0;
         if (flatmenu::OnWindowMessage(h, msg, (uintptr_t)w, (intptr_t)l, &done)) return (LRESULT)done;
     }
+    const bool repeat = (l & (1 << 30)) != 0;
+    if (msg == WM_KEYDOWN && w == VK_F6) {
+        const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        if (flycamToggle.Take(viewkeys::kShift, 6, (unsigned)w, true, repeat, shift && flycam::Available())) {
+            if (!repeat) flycam::Toggle();
+            return 0;
+        }
+    }
+    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && flycam::TakeKey((unsigned)w, true, repeat)) return 0;
+    if ((msg == WM_CHAR || msg == WM_SYSCHAR) && flycam::OwnsKey((unsigned)w)) return 0;
+
     // [openxr] laser_typing (vr/typed_keys.h): a key-down the plugin did not send - its own carry kOwnKeyTag, its posted Esc is known by
     // the time - lets the game take its keyboard layout while the laser holds the controller one. Raw input may come before the message.
     if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) {
@@ -136,7 +158,7 @@ LRESULT CALLBACK GameWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     // Enter opening the chat line: its letters may come before the game has
     // set its flag, so they are let through for a moment (not on the Enter
     // that sends the line - W pressed right after it walks).
-    if (msg == WM_KEYDOWN && w == VK_RETURN && !(l & (1 << 30)) && (ShooterActive() || VrKeyWalk()))
+    if (msg == WM_KEYDOWN && w == VK_RETURN && !repeat && (ShooterActive() || VrKeyWalk() || flycam::Active()))
         g_chatEnterAt.store(ChatFlagFound() && !ChatFlag() ? GetTickCount64() : 0);
     // Still swallowed with the keyboard move (FlatKeyMode): HookKeyMove's vector
     // replaces 0x8A960's answer, never adds to it, so a W A S D the player bound
@@ -184,7 +206,7 @@ LRESULT CALLBACK GameWndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     }
     // The mouse is ours too (KeysAsStick): the pointer kept in the middle would
     // flip the game to mouse mode - its pointer drawn there, a click a walk to it.
-    if (ShooterActive()) {
+    if (ShooterActive() || flycam::Active()) {
         if (msg == WM_SETCURSOR && LOWORD(l) == HTCLIENT) { SetCursor(nullptr); return TRUE; }
         if ((msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) || msg == WM_MOUSEHOVER || msg == WM_MOUSELEAVE) return 0;
         if (msg == WM_INPUT) {   // raw input: the mouse's dropped, the keyboard's passed on
@@ -487,13 +509,26 @@ void MouseTick() {
     // front) the pointer went wherever the mouse took it - that travel is no turn. The first look after it only puts the pointer back
     // in the middle; it was taken as one, and leaving a dialogue threw the view at the sky (from sajmonsoft's flat fork, 2026-10).
     static bool lookWasOn = false;
+    static bool flycamWasOn = false;
     const bool flat = FlatRules();   // (flat, VR F5)
-    if (!g_enabled.load() || !GameFocused()) { g_dragging = false; lookWasOn = false; return; }
+    const bool focused = GameFocused();
+    if (!g_enabled.load() || !focused) {
+        flycam::Stop(!focused);
+        g_dragging = false;
+        lookWasOn = flycamWasOn = false;
+        return;
+    }
+    if (flycam::Active() && !flycam::Available()) flycam::Stop();
+    const bool detached = flycam::Active();
+    if (detached != flycamWasOn) {
+        g_dragging = lookWasOn = false;
+        flycamWasOn = detached;
+    }
     POINT p{};
     if (!GetCursorPos(&p)) return;
     int dx = 0, dy = 0;
     RECT rc{};
-    if (ShooterActive() && g_gameWnd && GetClientRect(g_gameWnd, &rc)) {
+    if ((detached || ShooterActive()) && g_gameWnd && GetClientRect(g_gameWnd, &rc)) {
         POINT mid{rc.right / 2, rc.bottom / 2};
         ClientToScreen(g_gameWnd, &mid);
         dx = p.x - mid.x; dy = p.y - mid.y;
@@ -504,13 +539,17 @@ void MouseTick() {
         if (resumed) return;
     } else {
         lookWasOn = false;
-        if (!(GetAsyncKeyState(VK_MBUTTON) & 0x8000)) { g_dragging = false; return; }
+        if (detached || !(GetAsyncKeyState(VK_MBUTTON) & 0x8000)) { g_dragging = false; return; }
         if (g_dragging) { dx = p.x - g_dragLast.x; dy = p.y - g_dragLast.y; }
         g_dragging = true;
         g_dragLast = p;
     }
     if (!dx && !dy) return;
     const float k = g_set.mouseSpeed.load();
+    if (detached) {
+        flycam::AddLook(dx * k, dy * k);
+        return;
+    }
     g_mouseYaw.store(WrapDeg(g_mouseYaw.load() + dx * k));                       // right turns right
     g_mousePitch.store(std::clamp(g_mousePitch.load() + dy * k, -90.0f, 90.0f));  // down looks down
     g_gen.fetch_add(1);

@@ -1,6 +1,9 @@
 // vr/view/camera.cpp - cut from vr/vrcam.cpp (docs/plan_modules.md M16); what it gives: vr/view/camera.h. It sees vrcam.cpp's headers.
 #include "../vrcam_headers.h"
 #include "../billboards.h"   // [stereo] portal_once: the head's centre each view build
+#include "desktop_flycam.h"
+
+#include <mutex>
 
 using namespace D2RL;
 using namespace vrc;   // as in vrcam.cpp
@@ -10,6 +13,85 @@ namespace vrc {
 std::atomic<float> g_gameDownDeg{60.0f};   // the game camera's own downward angle, degrees (the flat view's last build)
 void FlatPortalFrame();   // [input] portal_look_horizon / portal_auto (below)
 void FlatPickupFrame();  // [input] flat_pickup_key_on (vr/input/flat_click.cpp)
+
+namespace flycam {
+namespace {
+std::atomic<bool> active{false};
+std::atomic<uint32_t> heldKeys{0};
+
+// The window thread owns the keys. The view builder steps the pose with look
+// deltas from MouseTick. The lock keeps each activation and its deltas together.
+std::mutex poseLock;
+Pose pose;
+bool needPose = true;
+ULONGLONG lastViewAt = 0;
+float pendingYaw = 0.0f, pendingPitch = 0.0f;
+}   // namespace
+
+bool Available() {
+    return g_set.platform.load() == 0 && ViewNow() == 2 && ThirdPerson()
+        && g_enabled.load() && g_inWorld.load() && !gamestate::MenuOpen() && !ChatOpen();
+}
+
+bool Active() { return active.load(); }
+
+bool BlocksHeroKeys() { return Active() || heldKeys.load() != 0; }
+
+void Toggle() {
+    const std::lock_guard<std::mutex> lock(poseLock);
+    if (!Available()) return;
+    needPose = true;
+    pendingYaw = pendingPitch = 0.0f;
+    const bool detached = !active.load();
+    active.store(detached);
+    Log(detached ? "vrcam: desktop flycam detached" : "vrcam: desktop flycam returned");
+}
+
+void Stop(bool releaseKeys) {
+    if (Active()) {
+        const std::lock_guard<std::mutex> lock(poseLock);
+        active.store(false);
+    }
+    if (releaseKeys) heldKeys.store(0);
+}
+
+bool TakeKey(unsigned key, bool down, bool repeat) {
+    const uint32_t bit = KeyBit(key);
+    if (!bit) return false;
+    if (!down) return (heldKeys.fetch_and(~bit) & bit) != 0;
+    if (heldKeys.load() & bit) return true;
+    if (repeat || !Active() || !Available()) return false;
+    heldKeys.fetch_or(bit);
+    return true;
+}
+
+bool OwnsKey(unsigned key) { return (heldKeys.load() & KeyBit(key)) != 0; }
+
+void AddLook(float yawDegrees, float pitchDegrees) {
+    if (!std::isfinite(yawDegrees) || !std::isfinite(pitchDegrees)) return;
+    const std::lock_guard<std::mutex> lock(poseLock);
+    if (!active.load()) return;
+    pendingYaw = std::remainder(pendingYaw + std::remainder(yawDegrees, 360.0f), 360.0f);
+    pendingPitch = std::clamp(pendingPitch + pitchDegrees, -180.0f, 180.0f);
+}
+
+static void Apply(V3& eye, V3& forward, V3& ahead, V3& right, V3& up) {
+    const std::lock_guard<std::mutex> lock(poseLock);
+    if (!active.load()) return;
+    const ULONGLONG now = GetTickCount64();
+    if (needPose) {
+        pose.Reset(eye, forward, up);
+        lastViewAt = now;
+        needPose = false;
+    }
+    const float dt = std::min(0.05f, float(now - lastViewAt) * 0.001f);
+    lastViewAt = now;
+    pose.Step(heldKeys.load(), dt, pendingYaw, pendingPitch, forward, ahead, right, up);
+    pendingYaw = pendingPitch = 0.0f;
+    eye = pose.eye;
+}
+}   // namespace flycam
+
 // [camera] smooth_follow (vr/smooth_follow.h): our camera's anchor - the game camera's look-at, the hero's point on his ground - eased over a jerk
 // (Serg 2026-11-22, Act 3's jungle: the camera shook as the hero jerked over the ground's bumps; 2026-11-23: "и в 2д виде" - every view our camera
 // builds on the look-at, first and third person, VR and flat: smoothfollow::Eases, FollowViewKind). One state, stepped once a game frame in VrFrame -
@@ -570,6 +652,7 @@ bool VrViewInner(const d2rcam::WorldView& in, float out[16]) {
     memcpy(g_lookAt, in.lookAt, sizeof g_lookAt);
     g_lookOk = in.lookAtValid;
     ReleaseSRWLockExclusive(&g_lookLock);
+    if (flycam::Active() && (!in.lookAtValid || !flycam::Available())) flycam::Stop();
     // [campfire] character creation's scene round the player (vr/campfire_unleashed.h): its own camera driven by the head
     if (campfire::Now()) return campfire::View(in, out);
     // The menus (the character screen's 3D scene too: it has a hero point) keep the game's camera.
@@ -764,6 +847,8 @@ bool VrViewInner(const d2rcam::WorldView& in, float out[16]) {
             nativeIpd = good.ipd;
         }
     }
+    // Keep the hero's anchor for world streaming while the view flies independently.
+    if (flycam::Active()) flycam::Apply(eye, fwd, ahead, right, up);
     g_viewBuilds.fetch_add(1);
     g_viewFwdY.store(fwd.y);
     g_viewRightY.store(right.y);

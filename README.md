@@ -94,6 +94,25 @@ plain F1 - F4 pick the views again (as before), or no F key at all (F12, Setting
   side). Turn it on in D2R VR Authentic Settings > **F5** tab ("F5: first person with the mouse, no hands"); that tab
   also places its toolbar, map and allies.
 
+## Desktop flycam
+
+In an offline game on the Flat platform, enter third person with **Shift + F2**.
+Press **Shift + F6** to detach the camera at its current pose. Press it again to
+return to the hero. Opening a menu or chat, changing views, or losing window
+focus also returns the camera.
+
+| Input | Detached camera |
+| --- | --- |
+| Mouse | Look right, left, up, and down |
+| W / S | Fly forward and backward along the view |
+| A / D | Strafe left and right |
+| Q / E | Descend and ascend |
+| Z / C | Bank left and right |
+
+Camera movement keys and mouse input belong to the flycam while it is active.
+The world still loads around the hero, so distant parts of the scene may disappear
+from the view.
+
 ## The game's video settings
 
 In Diablo II: Resurrected, Options > Video:
