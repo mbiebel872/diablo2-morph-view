@@ -110,6 +110,7 @@ focus also returns the camera.
 | Z / C | Bank left and right |
 
 Camera movement keys and mouse input belong to the flycam while it is active.
+The hero keeps their heading as you move and turn the flycam.
 The world still loads around the hero, so distant parts of the scene may disappear
 from the view.
 

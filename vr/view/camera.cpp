@@ -847,14 +847,15 @@ bool VrViewInner(const d2rcam::WorldView& in, float out[16]) {
             nativeIpd = good.ipd;
         }
     }
-    // Keep the hero's anchor for world streaming while the view flies independently.
+    // The hero's rig and controls keep the attached view's pose while the flycam draws its own view.
+    const V3 controlEye = eye, controlFwd = fwd, controlAhead = ahead, controlRight = right;
     if (flycam::Active()) flycam::Apply(eye, fwd, ahead, right, up);
     g_viewBuilds.fetch_add(1);
     g_viewFwdY.store(fwd.y);
     g_viewRightY.store(right.y);
     g_viewUpY.store(up.y);
-    g_gazeFwd[0].store(fwd.x); g_gazeFwd[1].store(fwd.y); g_gazeFwd[2].store(fwd.z);
-    g_gazeEyeH.store(eye.y - L[1]);
+    g_gazeFwd[0].store(controlFwd.x); g_gazeFwd[1].store(controlFwd.y); g_gazeFwd[2].store(controlFwd.z);
+    g_gazeEyeH.store(controlEye.y - L[1]);
     if (std::isfinite(pivotY)) {
         // [ceiling] min_headroom_m: how far the real head is over the hero's standing eyes (the room's head higher than the height set, a
         // recentre taken seated and then stood up), the jump taken off - eased over ~1 s each way and only ever 0 .. 1 m, so a nod or a
@@ -874,12 +875,12 @@ bool VrViewInner(const d2rcam::WorldView& in, float out[16]) {
     d2rcam::m4::LookTo(eye, fwd, up, view);
     const float hangA[3] = {hang.x, hang.y, hang.z};
     for (int i = 0; i < 3; ++i) g_eyeWorld[i].store(hangA[i]);
-    g_headCentre[0].store(eye.x); g_headCentre[1].store(eye.y); g_headCentre[2].store(eye.z);
+    g_headCentre[0].store(controlEye.x); g_headCentre[1].store(controlEye.y); g_headCentre[2].store(controlEye.z);
     {   // the portal and the screen-facing particles face this, not each eye's camera ([stereo] portal_once, vr/billboards.h)
         const float centre[3] = {eye.x, eye.y, eye.z};
         billboards::SetCenter(centre);
     }
-    g_headAhead[0].store(ahead.x); g_headAhead[1].store(ahead.y); g_headAhead[2].store(ahead.z);
+    g_headAhead[0].store(controlAhead.x); g_headAhead[1].store(controlAhead.y); g_headAhead[2].store(controlAhead.z);
     g_headOk.store(true);
     for (int i = 0; i < 3; ++i) g_eyeFromLook[i].store(hangA[i] - L[i]);
     g_eyeOk.store(true);
@@ -980,10 +981,9 @@ bool VrViewInner(const d2rcam::WorldView& in, float out[16]) {
     // What the stick needs: our right and forward on the ground, and the game
     // camera's screen axes in the world (it reads its stick on ITS screen).
     StickFrame f{};
-    const V3 r = right, a = ahead;
-    f.camR[0] = r.x; f.camR[1] = r.y; f.camR[2] = r.z;
-    f.camF[0] = a.x; f.camF[1] = a.y; f.camF[2] = a.z;
-    f.camLook[0] = fwd.x; f.camLook[1] = fwd.y; f.camLook[2] = fwd.z;   // (the view's own forward: the crosshair's pitch, [body] attack_lean / flat_aim_tilt)
+    f.camR[0] = controlRight.x; f.camR[1] = controlRight.y; f.camR[2] = controlRight.z;
+    f.camF[0] = controlAhead.x; f.camF[1] = controlAhead.y; f.camF[2] = controlAhead.z;
+    f.camLook[0] = controlFwd.x; f.camLook[1] = controlFwd.y; f.camLook[2] = controlFwd.z;   // [body] attack_lean / flat_aim_tilt
     f.scrR[0] = G[0]; f.scrR[1] = G[4]; f.scrR[2] = G[8];
     f.scrU[0] = G[1]; f.scrU[1] = G[5]; f.scrU[2] = G[9];
     // The game's own projection may mirror an axis; the stick is read on
@@ -992,12 +992,13 @@ bool VrViewInner(const d2rcam::WorldView& in, float out[16]) {
     f.mirY = in.gameProj[5] < 0.0f ? -1.0f : 1.0f;
     f.yawAtBuild = yaw;
     f.valid = true;
+    const float viewAhead[3] = {ahead.x, ahead.y, ahead.z};
     if (g_set.mapDirection.load()) {   // [hud] map_direction: the way this view looks, on the game's map (hud.cpp paints it)
-        const mapdir::Dir md = mapdir::OnGround(f.camF, f.scrR, f.scrU, f.mirX, f.mirY);   // (hud lays the arrow on the map: mapdir::IsoArrow)
+        const mapdir::Dir md = mapdir::OnGround(viewAhead, f.scrR, f.scrU, f.mirX, f.mirY);   // (hud lays the arrow on the map: mapdir::IsoArrow)
         if (md.ok) hud::SetMapHeading(md.x, md.y);
     }
     if (g_set.mapRotateFlat.load() && !FullBody()) {   // [hud] map_rotate_flat: the corner map on the screen turned so this way is up (F4 has its own)
-        float a[3] = {f.camF[0], f.camF[1], f.camF[2]};
+        float a[3] = {viewAhead[0], viewAhead[1], viewAhead[2]};
         if (TableView()) {   // VR F3: the head's way across the floor, held while it looks straight down at the diorama (mapturn::HeadHold)
             static mapturn::HeadHold floorHold;
             if (floorHold.Update(fwd.x, fwd.z)) { const V3 h = Facing(floorHold.roomYaw, 0.0f); a[0] = h.x; a[1] = h.y; a[2] = h.z; }
@@ -1012,7 +1013,7 @@ bool VrViewInner(const d2rcam::WorldView& in, float out[16]) {
     }
     AcquireSRWLockExclusive(&g_stickLock); g_stickFrame = f; ReleaseSRWLockExclusive(&g_stickLock);
     flog::Line("V,%u,%.4f,%d,%.3f,%.3f,%.3f,%.3f,%u", flog::Pass(), flog::Dt(), g_eye.load() & 1, yaw,
-               atan2f(f.camF[0], f.camF[2]) * 57.2957795f, L[0], L[2],
+               atan2f(ahead.x, ahead.z) * 57.2957795f, L[0], L[2],
                g_afrBlock ? g_afrBlock->stamp[g_eye.load() & 1] : 0u);
     memcpy(out, view, sizeof view);
     cbcmp::NoteView(g_eye.load(), view);
